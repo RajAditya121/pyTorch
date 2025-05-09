@@ -29,7 +29,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(dim, dim * mult, 1),
-            nn.GELU(),
+            nn.Hardswish(),
             nn.Dropout(dropout),
             nn.Conv2d(dim * mult, dim, 1),
             nn.Dropout(dropout)
@@ -52,11 +52,15 @@ class Attention(nn.Module):
         self.to_v = nn.Sequential(nn.Conv2d(dim, inner_dim_value, 1, bias = False), nn.BatchNorm2d(inner_dim_value))
 
         self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        out_batch_norm = nn.BatchNorm2d(dim_out)
+        nn.init.zeros_(out_batch_norm.weight)
 
         self.to_out = nn.Sequential(
             nn.GELU(),
             nn.Conv2d(inner_dim_value, dim_out, 1),
-            nn.BatchNorm2d(dim_out),
+            out_batch_norm,
             nn.Dropout(dropout)
         )
 
@@ -67,8 +71,8 @@ class Attention(nn.Module):
         q_range = torch.arange(0, fmap_size, step = (2 if downsample else 1))
         k_range = torch.arange(fmap_size)
 
-        q_pos = torch.stack(torch.meshgrid(q_range, q_range), dim = -1)
-        k_pos = torch.stack(torch.meshgrid(k_range, k_range), dim = -1)
+        q_pos = torch.stack(torch.meshgrid(q_range, q_range, indexing = 'ij'), dim = -1)
+        k_pos = torch.stack(torch.meshgrid(k_range, k_range, indexing = 'ij'), dim = -1)
 
         q_pos, k_pos = map(lambda t: rearrange(t, 'i j c -> (i j) c'), (q_pos, k_pos))
         rel_pos = (q_pos[:, None, ...] - k_pos[None, :, ...]).abs()
@@ -81,8 +85,7 @@ class Attention(nn.Module):
     def apply_pos_bias(self, fmap):
         bias = self.pos_bias(self.pos_indices)
         bias = rearrange(bias, 'i j h -> () h i j')
-        print(bias.shape, fmap.shape)
-        return fmap + bias
+        return fmap + (bias / self.scale)
 
     def forward(self, x):
         b, n, *_, h = *x.shape, self.heads
@@ -98,6 +101,7 @@ class Attention(nn.Module):
         dots = self.apply_pos_bias(dots)
 
         attn = self.attend(dots)
+        attn = self.dropout(attn)
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', h = h, y = y)
@@ -136,7 +140,6 @@ class LeViT(nn.Module):
         dim_key = 32,
         dim_value = 64,
         dropout = 0.,
-        emb_dropout = 0.,
         num_distill_classes = None
     ):
         super().__init__()
@@ -147,7 +150,7 @@ class LeViT(nn.Module):
 
         assert all(map(lambda t: len(t) == stages, (dims, depths, layer_heads))), 'dimensions, depths, and heads must be a tuple that is less than the designated number of stages'
 
-        self.to_patch_embedding = nn.Sequential(
+        self.conv_embedding = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride = 2, padding = 1),
             nn.Conv2d(32, 64, 3, stride = 2, padding = 1),
             nn.Conv2d(64, 128, 3, stride = 2, padding = 1),
@@ -177,7 +180,7 @@ class LeViT(nn.Module):
         self.mlp_head = nn.Linear(dim, num_classes)
 
     def forward(self, img):
-        x = self.to_patch_embedding(img)
+        x = self.conv_embedding(img)
 
         x = self.backbone(x)        
 

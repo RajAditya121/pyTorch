@@ -13,22 +13,13 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
-# pre-layernorm
-
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-    def forward(self, x, **kwargs):
-        return self.fn(self.norm(x), **kwargs)
-
 # feedforward
 
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout = 0.):
         super().__init__()
         self.net = nn.Sequential(
+            nn.LayerNorm(dim),
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -47,7 +38,10 @@ class Attention(nn.Module):
         self.heads = heads
         self.scale = dim_head ** -0.5
 
+        self.norm = nn.LayerNorm(dim)
         self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
         self.to_q = nn.Linear(dim, inner_dim, bias = False)
         self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
 
@@ -58,6 +52,7 @@ class Attention(nn.Module):
 
     def forward(self, x, context = None, kv_include_self = False):
         b, n, _, h = *x.shape, self.heads
+        x = self.norm(x)
         context = default(context, x)
 
         if kv_include_self:
@@ -69,6 +64,7 @@ class Attention(nn.Module):
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
 
         attn = self.attend(dots)
+        attn = self.dropout(attn)
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
@@ -83,8 +79,8 @@ class Transformer(nn.Module):
         self.norm = nn.LayerNorm(dim)
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
+                Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
+                FeedForward(dim, mlp_dim, dropout = dropout)
             ]))
 
     def forward(self, x):
@@ -118,8 +114,8 @@ class CrossTransformer(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                ProjectInOut(sm_dim, lg_dim, PreNorm(lg_dim, Attention(lg_dim, heads = heads, dim_head = dim_head, dropout = dropout))),
-                ProjectInOut(lg_dim, sm_dim, PreNorm(sm_dim, Attention(sm_dim, heads = heads, dim_head = dim_head, dropout = dropout)))
+                ProjectInOut(sm_dim, lg_dim, Attention(lg_dim, heads = heads, dim_head = dim_head, dropout = dropout)),
+                ProjectInOut(lg_dim, sm_dim, Attention(sm_dim, heads = heads, dim_head = dim_head, dropout = dropout))
             ]))
 
     def forward(self, sm_tokens, lg_tokens):
@@ -183,7 +179,9 @@ class ImageEmbedder(nn.Module):
 
         self.to_patch_embedding = nn.Sequential(
             Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size),
+            nn.LayerNorm(patch_dim),
             nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim)
         )
 
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))

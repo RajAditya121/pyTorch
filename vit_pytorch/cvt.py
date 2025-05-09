@@ -22,21 +22,23 @@ def group_by_key_prefix_and_remove_prefix(prefix, d):
 
 # classes
 
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
+class LayerNorm(nn.Module): # layernorm, but done in the channel dimension #1
+    def __init__(self, dim, eps = 1e-5):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-    def forward(self, x, **kwargs):
-        x = rearrange(x, 'b c h w -> b h w c')
-        x = self.norm(x)
-        x = rearrange(x, 'b h w c -> b c h w')
-        return self.fn(x, **kwargs)
+        self.eps = eps
+        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.b = nn.Parameter(torch.zeros(1, dim, 1, 1))
+
+    def forward(self, x):
+        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
+        mean = torch.mean(x, dim = 1, keepdim = True)
+        return (x - mean) / (var + self.eps).sqrt() * self.g + self.b
 
 class FeedForward(nn.Module):
     def __init__(self, dim, mult = 4, dropout = 0.):
         super().__init__()
         self.net = nn.Sequential(
+            LayerNorm(dim),
             nn.Conv2d(dim, dim * mult, 1),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -65,10 +67,12 @@ class Attention(nn.Module):
         self.heads = heads
         self.scale = dim_head ** -0.5
 
+        self.norm = LayerNorm(dim)
         self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
 
-        self.to_q = DepthWiseConv2d(dim, inner_dim, 3, padding = padding, stride = 1, bias = False)
-        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, 3, padding = padding, stride = kv_proj_stride, bias = False)
+        self.to_q = DepthWiseConv2d(dim, inner_dim, proj_kernel, padding = padding, stride = 1, bias = False)
+        self.to_kv = DepthWiseConv2d(dim, inner_dim * 2, proj_kernel, padding = padding, stride = kv_proj_stride, bias = False)
 
         self.to_out = nn.Sequential(
             nn.Conv2d(inner_dim, dim, 1),
@@ -78,12 +82,15 @@ class Attention(nn.Module):
     def forward(self, x):
         shape = x.shape
         b, n, _, y, h = *shape, self.heads
+
+        x = self.norm(x)
         q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim = 1))
         q, k, v = map(lambda t: rearrange(t, 'b (h d) x y -> (b h) (x y) d', h = h), (q, k, v))
 
         dots = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
         attn = self.attend(dots)
+        attn = self.dropout(attn)
 
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) (x y) d -> b (h d) x y', h = h, y = y)
@@ -95,8 +102,8 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim, proj_kernel = proj_kernel, kv_proj_stride = kv_proj_stride, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_mult, dropout = dropout))
+                Attention(dim, proj_kernel = proj_kernel, kv_proj_stride = kv_proj_stride, heads = heads, dim_head = dim_head, dropout = dropout),
+                FeedForward(dim, mlp_mult, dropout = dropout)
             ]))
     def forward(self, x):
         for attn, ff in self.layers:
@@ -130,7 +137,7 @@ class CvT(nn.Module):
         s3_emb_stride = 2,
         s3_proj_kernel = 3,
         s3_kv_proj_stride = 2,
-        s3_heads = 4,
+        s3_heads = 6,
         s3_depth = 10,
         s3_mlp_mult = 4,
         dropout = 0.
@@ -146,17 +153,20 @@ class CvT(nn.Module):
 
             layers.append(nn.Sequential(
                 nn.Conv2d(dim, config['emb_dim'], kernel_size = config['emb_kernel'], padding = (config['emb_kernel'] // 2), stride = config['emb_stride']),
+                LayerNorm(config['emb_dim']),
                 Transformer(dim = config['emb_dim'], proj_kernel = config['proj_kernel'], kv_proj_stride = config['kv_proj_stride'], depth = config['depth'], heads = config['heads'], mlp_mult = config['mlp_mult'], dropout = dropout)
             ))
 
             dim = config['emb_dim']
 
-        self.layers = nn.Sequential(
-            *layers,
+        self.layers = nn.Sequential(*layers)
+
+        self.to_logits = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             Rearrange('... () () -> ...'),
             nn.Linear(dim, num_classes)
         )
 
     def forward(self, x):
-        return self.layers(x)
+        latents = self.layers(x)
+        return self.to_logits(latents)

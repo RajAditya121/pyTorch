@@ -17,18 +17,11 @@ def conv_output_size(image_size, kernel_size, stride, padding = 0):
 
 # classes
 
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-    def forward(self, x, **kwargs):
-        return self.fn(self.norm(x), **kwargs)
-
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout = 0.):
         super().__init__()
         self.net = nn.Sequential(
+            nn.LayerNorm(dim),
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -47,7 +40,9 @@ class Attention(nn.Module):
         self.heads = heads
         self.scale = dim_head ** -0.5
 
+        self.norm = nn.LayerNorm(dim)
         self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
 
         self.to_out = nn.Sequential(
@@ -57,12 +52,15 @@ class Attention(nn.Module):
 
     def forward(self, x):
         b, n, _, h = *x.shape, self.heads
+
+        x = self.norm(x)
         qkv = self.to_qkv(x).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), qkv)
 
         dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
 
         attn = self.attend(dots)
+        attn = self.dropout(attn)
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
@@ -74,8 +72,8 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
+                Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
+                FeedForward(dim, mlp_dim, dropout = dropout)
             ]))
     def forward(self, x):
         for attn, ff in self.layers:
@@ -89,8 +87,8 @@ class DepthWiseConv2d(nn.Module):
     def __init__(self, dim_in, dim_out, kernel_size, padding, stride, bias = True):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(dim_in, dim_in, kernel_size = kernel_size, padding = padding, groups = dim_in, stride = stride, bias = bias),
-            nn.Conv2d(dim_in, dim_out, kernel_size = 1, bias = bias)
+            nn.Conv2d(dim_in, dim_out, kernel_size = kernel_size, padding = padding, groups = dim_in, stride = stride, bias = bias),
+            nn.Conv2d(dim_out, dim_out, kernel_size = 1, bias = bias)
         )
     def forward(self, x):
         return self.net(x)
@@ -129,14 +127,15 @@ class PiT(nn.Module):
         mlp_dim,
         dim_head = 64,
         dropout = 0.,
-        emb_dropout = 0.
+        emb_dropout = 0.,
+        channels = 3
     ):
         super().__init__()
         assert image_size % patch_size == 0, 'Image dimensions must be divisible by the patch size.'
         assert isinstance(depth, tuple), 'depth must be a tuple of integers, specifying the number of blocks before each downsizing'
         heads = cast_tuple(heads, len(depth))
 
-        patch_dim = 3 * patch_size ** 2
+        patch_dim = channels * patch_size ** 2
 
         self.to_patch_embedding = nn.Sequential(
             nn.Unfold(kernel_size = patch_size, stride = patch_size // 2),
@@ -162,8 +161,9 @@ class PiT(nn.Module):
                 layers.append(Pool(dim))
                 dim *= 2
 
-        self.layers = nn.Sequential(
-            *layers,
+        self.layers = nn.Sequential(*layers)
+
+        self.mlp_head = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, num_classes)
         )
@@ -174,7 +174,9 @@ class PiT(nn.Module):
 
         cls_tokens = repeat(self.cls_token, '() n d -> b n d', b = b)
         x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding
+        x += self.pos_embedding[:, :n+1]
         x = self.dropout(x)
 
-        return self.layers(x)
+        x = self.layers(x)
+
+        return self.mlp_head(x[:, 0])
